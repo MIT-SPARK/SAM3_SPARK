@@ -186,6 +186,61 @@ class TransformerDecoderLayer(nn.Module):
 
         return tgt, presence_token_out
 
+    def forward_presence_only(
+        self,
+        presence_token: Tensor,
+        memory_text: Optional[Tensor] = None,
+        text_attention_mask: Optional[Tensor] = None,
+        memory: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        memory_pos: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Run only the presence token through this layer, skipping object queries.
+
+        Self-attention is the presence token attending to itself (identity-like),
+        then text cross-attention, then image cross-attention (no boxRPB mask),
+        then FFN.
+        """
+        tgt = presence_token  # [1, bs, d_model]
+        tgt_query_pos = torch.zeros_like(tgt)
+
+        # Self-attention (presence token with itself)
+        if self.self_attn is not None:
+            q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            tgt2 = self.self_attn(q, k, tgt)[0]
+            tgt = tgt + self.dropout2(tgt2)
+            tgt = self.norm2(tgt)
+
+        # Text cross-attention
+        if self.use_text_cross_attention:
+            tgt2 = self.ca_text(
+                self.with_pos_embed(tgt, tgt_query_pos),
+                memory_text,
+                memory_text,
+                key_padding_mask=text_attention_mask,
+            )[0]
+            tgt = tgt + self.catext_dropout(tgt2)
+            tgt = self.catext_norm(tgt)
+
+        # Image cross-attention (no boxRPB mask needed)
+        tgt2 = self.cross_attn(
+            query=self.with_pos_embed(tgt, tgt_query_pos),
+            key=self.with_pos_embed(memory, memory_pos),
+            value=memory,
+            key_padding_mask=(
+                memory_key_padding_mask.transpose(0, 1)
+                if memory_key_padding_mask is not None
+                else None
+            ),
+        )[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        # FFN
+        tgt = self.forward_ffn(tgt)
+        return tgt
+
 
 class TransformerDecoder(nn.Module):
     def __init__(
@@ -609,6 +664,45 @@ class TransformerDecoder(nn.Module):
             ),
             presence_feats,
         )
+
+    def forward_presence_only(
+        self,
+        memory,
+        memory_key_padding_mask=None,
+        pos=None,
+        memory_text=None,
+        text_attention_mask=None,
+    ):
+        """
+        Run only the presence token through the decoder (no object queries).
+
+        Returns the final presence logit — same as the last element of
+        ``intermediate_presence_logits`` from ``forward()``, but ~200x fewer
+        tokens in every attention operation.
+        """
+        assert self.presence_token is not None, "Model has no presence token"
+        bs = memory.shape[1]
+        presence_out = self.presence_token.weight[None].expand(1, bs, -1)
+
+        for layer in self.layers:
+            presence_out = layer.forward_presence_only(
+                presence_token=presence_out,
+                memory_text=memory_text,
+                text_attention_mask=text_attention_mask,
+                memory=memory,
+                memory_key_padding_mask=memory_key_padding_mask,
+                memory_pos=pos,
+            )
+
+        presence_logit = self.presence_token_head(
+            self.presence_token_out_norm(presence_out)
+        ).squeeze(-1)  # [1, bs]
+        if self.clamp_presence_logits:
+            presence_logit.clamp_(
+                min=-self.clamp_presence_logit_max_val,
+                max=self.clamp_presence_logit_max_val,
+            )
+        return presence_logit
 
 
 class TransformerEncoderCrossAttention(nn.Module):

@@ -39,11 +39,12 @@ class Sam3Processor:
         )
 
     @torch.inference_mode()
-    def set_image(self, image, state=None):
+    def set_image(self, image, state=None, h=None, w=None):
         """Sets the image on which we want to do predictions."""
         if state is None:
             state = {}
 
+        # 1. Metadata extraction (CPU)
         if isinstance(image, PIL.Image.Image):
             width, height = image.size
         elif isinstance(image, (torch.Tensor, np.ndarray)):
@@ -51,12 +52,23 @@ class Sam3Processor:
         else:
             raise ValueError("Image must be a PIL image or a tensor")
 
+        # 2. Data Transfer & Preprocessing
+        # This captures the time to move the image to GPU and run transforms
+        
         image = v2.functional.to_image(image).to(self.device)
         image = self.transform(image).unsqueeze(0)
 
-        state["original_height"] = height
-        state["original_width"] = width
+        # 3. Backbone Inference (The likely heavy hitter)
+        if h is not None and w is not None:
+            state["original_height"] = h
+            state["original_width"] = w
+        else:
+            state["original_height"] = height
+            state["original_width"] = width
+        
         state["backbone_out"] = self.model.backbone.forward_image(image)
+
+        # 4. SAM2 Interactivity & FPN Adjustments
         inst_interactivity_en = self.model.inst_interactive_predictor is not None
         if inst_interactivity_en and "sam2_backbone_out" in state["backbone_out"]:
             sam2_backbone_out = state["backbone_out"]["sam2_backbone_out"]
@@ -70,10 +82,11 @@ class Sam3Processor:
                     sam2_backbone_out["backbone_fpn"][1]
                 )
             )
+        
         return state
 
     @torch.inference_mode()
-    def set_image_batch(self, images: List[np.ndarray], state=None):
+    def set_image_batch(self, images: List[np.ndarray], state=None, h=None, w=None):
         """Sets the image batch on which we want to do predictions."""
         if state is None:
             state = {}
@@ -85,8 +98,12 @@ class Sam3Processor:
             images[0], PIL.Image.Image
         ), "Images must be a list of PIL images"
 
-        state["original_heights"] = [image.height for image in images]
-        state["original_widths"] = [image.width for image in images]
+        if h is not None and w is not None:
+            state["original_height"] = [h] * len(images)
+            state["original_width"] = [w] * len(images)
+        else:
+            state["original_heights"] = [image.height for image in images]
+            state["original_widths"] = [image.width for image in images]
 
         images = [
             self.transform(v2.functional.to_image(image).to(self.device))
@@ -111,17 +128,15 @@ class Sam3Processor:
 
     @torch.inference_mode()
     def set_text_prompt(self, prompt: str, state: Dict):
-        """Sets the text prompt and run the inference"""
-
         if "backbone_out" not in state:
             raise ValueError("You must call set_image before set_text_prompt")
 
         text_outputs = self.model.backbone.forward_text([prompt], device=self.device)
-        # will erase the previous text prompt if any
+
         state["backbone_out"].update(text_outputs)
         if "geometric_prompt" not in state:
             state["geometric_prompt"] = self.model._get_dummy_prompt()
-
+        
         return self._forward_grounding(state)
 
     @torch.inference_mode()
@@ -207,7 +222,6 @@ class Sam3Processor:
         img_w = state["original_width"]
         scale_fct = torch.tensor([img_w, img_h, img_w, img_h]).to(self.device)
         boxes = boxes * scale_fct[None, :]
-
         out_masks = interpolate(
             out_masks.unsqueeze(1),
             (img_h, img_w),
